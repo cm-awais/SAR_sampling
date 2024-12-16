@@ -156,7 +156,7 @@ class FineTunedResNet(nn.Module):
     
 def vit(classes, frozen=True):
     vit_model = timm.create_model("vit_base_patch16_224", pretrained=True)
-    vit_model.head = nn.Linear(vit_model.head.in_features, classes)
+    # vit_model.head = nn.Linear(vit_model.head.in_features, classes)
 
 
     if frozen:
@@ -166,29 +166,20 @@ def vit(classes, frozen=True):
             param.requires_grad = False
     
     return vit_model
-
-class ViTModel(nn.Module):
-    def __init__(self, num_classes, frozen=True):
-        super().__init__()
-        self.features = timm.create_model("vit_base_patch16_224", pretrained=True)
-        self.vit_model.head = nn.Linear(self.features.head.in_features, num_classes)
-
-        if frozen:
-            for param in self.features.patch_embed.parameters():
-                param.requires_grad = False
-            for param in self.features.blocks.parameters():
-                param.requires_grad = False
-
-    def forward(self, x):
-        return self.vit_model(x)
   
 # Define a simple classifier to determine minority class membership
 class MinorityClassClassifier(nn.Module):
-    def __init__(self, input_size, classes):
+    def __init__(self, input_size, classes, mod=None):
         super(MinorityClassClassifier, self).__init__()
         # self.fc = nn.Linear(input_size, 2)  # Assuming binary classification
-        
-        self.avgpool = nn.AdaptiveAvgPool2d((7, 7))  # Global Average Pooling
+        self.mod = mod
+        if "VGG" in mod:
+            input_size = 512 * 7 * 7
+        if "Res" in mod:
+            input_size = 10 * 10
+        self.avgpool_res = nn.AdaptiveAvgPool2d((10, 10))  # Global Average Pooling
+        self.pool_res = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.avgpool_vgg = nn.AdaptiveAvgPool2d((7, 7))  # Global Average Pooling
         self.fc = nn.Sequential(
           nn.Linear(input_size, 4096),  # Adjust based on input size
           nn.ReLU(inplace=True),
@@ -197,8 +188,12 @@ class MinorityClassClassifier(nn.Module):
     )
 
     def forward(self, x):
-        x = x.view(x.size(0), -1)    
-        x = self.avgpool(x)
+        if "VGG" in self.mod:
+            x = self.avgpool_vgg(x)
+        if "Res" in self.mod:
+            x = x.view(x.size(0), -1, x.size(1), 1)
+            x = self.avgpool_res(x)
+        
         x = torch.flatten(x, 1)
         x = self.fc(x)
         return x
