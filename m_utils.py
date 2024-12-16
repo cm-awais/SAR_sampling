@@ -80,7 +80,7 @@ def cal_scores(targets, predictions, check=False):
 
 
 # Evaluation function 
-def evaluate_model(model, data_loader, device):
+def evaluate_model(model, data_loader, feature_extractor, device):
     model.eval()
     model.to(device)
     saving_string = ""
@@ -92,7 +92,8 @@ def evaluate_model(model, data_loader, device):
         for batch_idx, (data, target) in enumerate(data_loader):
             data, target = data.to(device), target.to(device)
             # print(data.shape, target.shape)
-            output = model(data)
+            features = feature_extractor(data)
+            output = model(features)
             _, predicted = torch.max(output.data, 1)
             predictions.extend(predicted)
             targets.extend(target)
@@ -234,20 +235,23 @@ print("DataLoaders created successfully.")
 
 print("Loading Data")
 
-def get_loaders_b(data, batch_size):
+def get_loaders_b(path, data, batch_size):
     loaders = []
-    fusar_path = "c_fusar_splited"
-    opensar_path = "c_opensar_splited"
-    classes = 0
-    models = {}
-    if data == 0:
-        loaders.append(load_data(opensar_path + "/train", batch_size=batch_size))
-        loaders.append(load_data(opensar_path + "/val", batch_size=batch_size))
-        loaders.append(load_data(opensar_path + "/test", batch_size=batch_size))
-    else:
-        loaders.append(load_data(fusar_path + "/train", batch_size=batch_size))
-        loaders.append(load_data(fusar_path + "/val", batch_size=batch_size))
-        loaders.append(load_data(fusar_path + "/test", batch_size=batch_size))
+    loaders.append(load_data(path + "/train", batch_size=batch_size))
+    loaders.append(load_data(path + "/val", batch_size=batch_size))
+    loaders.append(load_data(path + "/test", batch_size=batch_size))
+    # fusar_path = path
+    # opensar_path = path
+    # classes = 0
+    # models = {}
+    # if data == 0:
+    #     loaders.append(load_data(opensar_path + "/train", batch_size=batch_size))
+    #     loaders.append(load_data(opensar_path + "/val", batch_size=batch_size))
+    #     loaders.append(load_data(opensar_path + "/test", batch_size=batch_size))
+    # else:
+    #     loaders.append(load_data(fusar_path + "/train", batch_size=batch_size))
+    #     loaders.append(load_data(fusar_path + "/val", batch_size=batch_size))
+    #     loaders.append(load_data(fusar_path + "/test", batch_size=batch_size))
     
     return loaders
 
@@ -277,21 +281,26 @@ def m2m_creation(train_loader, feature_extractor, classes):
     synthetic_features = []
     synthetic_labels = []
 
-    for inputs, targets in train_loader:
+    for id, (inputs, targets) in enumerate(train_loader):
+        # print(id)
         with torch.no_grad():
             inputs = inputs.cuda()  # Move to GPU if available
-            extracted_features = feature_extractor(inputs).mean(dim=(2, 3))  # Global average pooling
+            w_feat = feature_extractor(inputs)
+            # print(w_feat.shape)
+            extracted_features = w_feat #.mean(dim=(2, 3))  # Global average pooling
             features.append(extracted_features)
             labels.append(targets)
     features = torch.cat(features, dim=0)  # Combine all feature tensors
     labels = torch.cat(labels, dim=0)      # Combine all label tensors
 
-    num_classes = len(classes)
+    print(id)
+
+    num_classes = classes
     centroids = calculate_centroids(features, labels, num_classes)
 
     # Identify minority classes (e.g., classes with fewer than a threshold number of samples)
     class_counts = torch.bincount(labels)
-    minority_classes = torch.where(class_counts < 100)[0]  # Adjust threshold as needed
+    minority_classes = torch.where(class_counts < 66)[0]  # Adjust threshold as needed
 
     for target_class in minority_classes:
         features_aug, labels_aug = generate_synthetic_samples(features, labels, centroids, target_class)
@@ -306,6 +315,9 @@ def m2m_creation(train_loader, feature_extractor, classes):
     augmented_labels = torch.cat([labels, synthetic_labels], dim=0)
 
     input_size = augmented_features.size(1)  # Size of feature vector
+    # print(augmented_features.shape)
+    # print(synthetic_features.shape)
+    # print(features.shape)
 
     # Create DataLoader
     augmented_dataset = TensorDataset(augmented_features, augmented_labels)
@@ -317,6 +329,7 @@ def m2m_creation(train_loader, feature_extractor, classes):
 def train_save(c_datasets_b, models, l_rate, device, epochs, classes, lf, ds):
     csv_res = []
     csv1 = []
+    results = ""
     ds = ""
     for dataset_name, dataset_loader in c_datasets_b.items():
         print("Training on ", dataset_name)
@@ -327,11 +340,19 @@ def train_save(c_datasets_b, models, l_rate, device, epochs, classes, lf, ds):
         val_loader_m = dataset_loader[1]
         test_loader_m = dataset_loader[2]
         for model_name, model in models.items():
-            ip, dataset_loader = m2m_creation(train_loader=dataset_loader, feature_extractor=model.features, classes=classes)
+            feature_extractor = None
+            if "VIT" in model_name:
+                feature_extractor = model
+                print("VIT", model_name)
+            else:
+                feature_extractor = model.features
+                print("Non Vit", model_name)
+            feature_extractor.to(device)
+            ip, train_loader_n = m2m_creation(train_loader=train_loader_m, feature_extractor=feature_extractor, classes=classes)
             print("Training using :" , model_name)
             results += "Training using "+model_name + "\n"
                 
-            n_model = MinorityClassClassifier(input_size=ip, classes=classes)
+            n_model = MinorityClassClassifier(input_size=ip, classes=classes, mod=model_name)
             n_model.apply(initialize_weights)
             optimizer = optim.Adam(n_model.parameters(), lr=l_rate)
             n_model.to(device)
@@ -339,7 +360,7 @@ def train_save(c_datasets_b, models, l_rate, device, epochs, classes, lf, ds):
             for epoch in range(epochs):
                 n_model.train()
                 # print(epoch)
-                for batch_idx, data in enumerate(train_loader_m):
+                for batch_idx, data in enumerate(train_loader_n):
                     data, target = data[0].to(device), data[1].to(device)
 
                     optimizer.zero_grad()
@@ -352,11 +373,11 @@ def train_save(c_datasets_b, models, l_rate, device, epochs, classes, lf, ds):
                 # else:
                 print("Validation: ", dataset_name)
                 results += f"Validation {model_name} on {dataset_name} \n"
-                str_results, _ = evaluate_model(n_model, val_loader_m, device=device)
+                str_results, _ = evaluate_model(n_model, val_loader_m, feature_extractor=feature_extractor, device=device)
                 results += str_results
             print("Testing: ", dataset_name)
             results += f"Testing {model_name} on {dataset_name} \n"
-            str_results, csv_scores = evaluate_model(n_model, test_loader_m, device=device)
+            str_results, csv_scores = evaluate_model(n_model, test_loader_m, feature_extractor=feature_extractor, device=device)
             results += str_results
             csv_res.append(csv_scores)
             csv1.append(csv_scores)
