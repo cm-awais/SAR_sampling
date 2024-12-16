@@ -26,19 +26,21 @@ print(device)
 
 classes = 9
 lf = nn.CrossEntropyLoss()
-epochs = 30
+epochs = 1
 l_rate = 0.001
 batch_size = 32
 
-models = {"NVIT": ViTModel(classes, frozen=False),
-    "VIT": ViTModel(classes, frozen=True),
+models = {
+    "NVIT": vit(classes, frozen=False),
+    "VIT": vit(classes, frozen=True),
     "VGG": VGGModel(classes),
     "Fine_VGG": FineTunedVGG(classes),
     "ResNet": ResNetModel(classes),
     "Fine_Resnet": FineTunedResNet(classes)
     }
 
-c_datasets_b = {"Fusar": get_loaders_b(1, batch_size=batch_size)}
+path = "/home/si-lab/Desktop/Projects/1-thesis/Ship-Classification-SAR-DL/experiments/curriculum/c_fusar_splited"
+c_datasets_b = {"Fusar": get_loaders_b(path, 1, batch_size=batch_size)}
 
 
-train_save(c_datasets_b=c_datasets_b, models=models, l_rate=l_rate, device=device, epochs=epochs, classes=classes, lf=lf)
+train_save(c_datasets_b=c_datasets_b, models=models, l_rate=l_rate, device=device, epochs=epochs, classes=classes, lf=lf, ds="fusar")
