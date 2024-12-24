@@ -1,19 +1,22 @@
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Subset, WeightedRandomSampler
 from torchvision.datasets import ImageFolder
 import json
 import os
 import torch.optim as optim
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
 import torchvision.transforms as transforms
 import csv
-from m_models import MinorityClassClassifier
+# from m_models import MinorityClassClassifier
+from m_models import *
+from collections import Counter
 
-transform_train = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
+# transform_train = transforms.Compose([
+#     transforms.Resize((64, 64)),
+#     transforms.ToTensor(),
+# ])
 
 def get_classification_metrics(true_labels, predicted_labels):
     """
@@ -92,7 +95,10 @@ def evaluate_model(model, data_loader, feature_extractor, device):
         for batch_idx, (data, target) in enumerate(data_loader):
             data, target = data.to(device), target.to(device)
             # print(data.shape, target.shape)
-            features = feature_extractor(data)
+            features = data
+            if feature_extractor is not None:
+                features = feature_extractor(data)  # uncomment
+            
             output = model(features)
             _, predicted = torch.max(output.data, 1)
             predictions.extend(predicted)
@@ -102,19 +108,41 @@ def evaluate_model(model, data_loader, feature_extractor, device):
 
     accuracy = 100 * correct / total
     saving_string += f"Accuracy: {accuracy:.2f}% \n"
-    print(f"Accuracy: {accuracy:.2f}%")
+    # print(f"Accuracy: {accuracy:.2f}%")
     print()
     dicrt, scores = cal_scores(predictions=predictions, targets=targets, check=True)
-    print(dicrt)
+    # print(dicrt)
     saving_string += json.dumps(dicrt, indent=4)
-    return saving_string, scores
+    return saving_string, scores, dicrt
 
-def load_data(address, batch_size=32, train=True):
+def print_data_ratios(dataloader):
+    """
+    Prints the class ratios from a given PyTorch DataLoader.
+
+    Args:
+        dataloader (DataLoader): The PyTorch DataLoader to analyze.
+    """
+    # Collect all labels from the dataloader
+    all_labels = []
+    for _, labels in dataloader:
+        all_labels.extend(labels.numpy())  # Convert labels tensor to numpy and extend the list
+
+    # Count the occurrences of each class
+    class_counts = Counter(all_labels)
+    total_samples = sum(class_counts.values())
+
+    # Calculate and print class ratios
+    class_ratios = {cls: count / total_samples for cls, count in class_counts.items()}
+    print("Updated Class Ratios:", class_ratios)
+
+def load_data(address, classes_l, transform_train, batch_size=32, train=True):
+  new_class_to_idx = {}
+  dataset = ImageFolder(root=address, transform=transform_train)
   # Load Fusar dataset
-  if train:
-    dataset = ImageFolder(root=address, transform=transform_train)
-  else: 
-    dataset = ImageFolder(root=address, transform=transform_train)
+  for id, class_n in enumerate(classes_l):
+    new_class_to_idx[class_n] = id
+
+  dataset.class_to_idx = new_class_to_idx
 
   # Create a dictionary of class names
   class_names = {i: classname for i, classname in enumerate(dataset.classes)}
@@ -127,27 +155,73 @@ def load_data(address, batch_size=32, train=True):
 
   return data_loader
 
+def load_data_m2m(address, classes_l, transform_train, batch_size=32, dataset_size=None, train=True):
+    """
+    Load a dataset, calculate class ratios dynamically, and create a DataLoader with oversampling.
 
-# Function to calculate per-class validation loss
-def compute_classwise_validation_loss(model, val_loader, loss_fn, num_classes, device):
-    model.eval()
-    class_loss = torch.zeros(num_classes, device=device)
-    class_count = torch.zeros(num_classes, device=device)
+    Args:
+        address (str): Path to the dataset.
+        transform_train (torchvision.transforms): Transformations to apply to the dataset.
+        batch_size (int): Batch size for the DataLoader.
+        dataset_size (int or None): Total number of samples in the dataset. If None, it is computed dynamically.
+        train (bool): Whether the dataset is for training or not.
 
-    with torch.no_grad():
-        for inputs, targets in val_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
+    Returns:
+        DataLoader: A PyTorch DataLoader with oversampling.
+    """
+    # Load the dataset
+    new_class_to_idx = {}
+    dataset = ImageFolder(root=address, transform=transform_train)
 
-            outputs = model(inputs)
-            loss_per_sample = loss_fn(outputs, targets)  # Individual losses
-            for i in range(num_classes):
-                mask = targets == i  # Select samples for class i
-                class_loss[i] += loss_per_sample[mask].sum()
-                class_count[i] += mask.sum()
+    for id, class_n in enumerate(classes_l):
+        new_class_to_idx[class_n] = id
 
-    # Avoid division by zero
-    class_loss /= (class_count + 1e-5)
-    return class_loss
+    dataset.class_to_idx = new_class_to_idx
+    
+    # Calculate class distribution
+    class_counts = Counter([label for _, label in dataset])  # Count samples per class
+    total_samples = sum(class_counts.values())
+    class_ratios = {cls: count / total_samples for cls, count in class_counts.items()}
+    
+    print("Class distribution:", class_counts)
+    print("Class ratios:", class_ratios)
+
+    # Calculate the number of samples per class based on ratios
+    if dataset_size is None:
+        dataset_size = total_samples  # Use the dataset's total size if not provided
+
+    num_sample_per_class = [int(class_ratios[cls] * dataset_size) for cls in range(len(class_counts))]
+    print("Calculated samples per class:", num_sample_per_class)
+
+    # Create oversampled weights
+    def get_oversampled_data(dataset, num_sample_per_class):
+        length = len(dataset)
+        num_sample_per_class = list(num_sample_per_class)
+        num_samples = list(num_sample_per_class)
+
+        selected_list = []
+        indices = list(range(length))
+        for i in range(length):
+            _, label = dataset.__getitem__(indices[i])
+            if num_sample_per_class[label] > 0:
+                selected_list.append(1 / num_samples[label])
+                num_sample_per_class[label] -= 1
+
+        return selected_list
+
+    oversampled_weights = get_oversampled_data(dataset, num_sample_per_class)
+    print("Generated oversampling weights:", oversampled_weights[:10], "...")
+
+    # Use WeightedRandomSampler for balanced sampling
+    sampler = WeightedRandomSampler(oversampled_weights, len(oversampled_weights))
+
+    # Create the DataLoader
+    data_loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=2, persistent_workers=True)
+
+    print_data_ratios(data_loader)
+
+    print("DataLoader created with oversampling.")
+    return data_loader
 
 # weights initialization
 def initialize_weights(m):
@@ -156,102 +230,16 @@ def initialize_weights(m):
         if m.bias is not None:
             nn.init.zeros_(m.bias)
 
-# Function to compute weights
-def compute_weights_with_zeros(ratios):
-    ratios = torch.tensor(ratios, dtype=torch.float32)
-    # Replace zeros with a very small value to avoid division errors
-    safe_ratios = torch.where(ratios == 0, torch.tensor(1e-5), ratios)
-    weights = 1.0 / safe_ratios  # Inverse of ratios
-    normalized_weights = weights / weights.sum()  # Normalize weights
-    return normalized_weights.tolist()
-
-def compute_weights_baseline(ratios):
-    # Calculate weights as inverse of ratios
-    weights = 1.0 / ratios
-
-    # Normalize weights (optional, ensures the weights sum to 1)
-    normalized_weights = weights / weights.sum()
-
-    return normalized_weights
-
-def compute_weights_levels(data):
-    """data=0: opensar, data=1 fusar"""
-    if data == 0:
-        # Ratios for OpenSAR
-        l1 = [67.02181634, 32.97818366, 0, 0, 0, 0]
-        l2 = [36.58536585, 29.57317073, 17.07317073, 16.76829268, 0, 0]
-        l3 = [29.27927928, 22.97297297, 12.61261261, 12.38738739, 11.71171171, 11.03603604]
-    else:
-        # Ratios for Fusar
-        l1 = [58.18908123, 41.81091877, 0, 0, 0, 0, 0, 0, 0]
-        l2 = [30.23255814, 29.71576227, 20.93023256, 19.12144703, 0, 0, 0, 0, 0]
-        l3 = [24.06181015, 12.80353201, 11.9205298, 9.713024283, 9.933774834, 8.609271523, 9.492273731, 7.06401766, 6.401766004]
-
-    # Compute weights for each level
-    weights_l1 = compute_weights_with_zeros(l1)
-    weights_l2 = compute_weights_with_zeros(l2)
-    weights_l3 = compute_weights_with_zeros(l3)
-
-    return [weights_l1, weights_l2, weights_l3]
-
-
-def get_loaders(dir, data):
-    new_class_to_idx = {}
-    if data==0:
-        new_class_to_idx = {'Cargo': 0, 'Tanker': 1, 'Dredging': 2, 'Fishing': 3, 'Passenger': 4, 'Tug': 5}
-    else:
-        new_class_to_idx = {'Cargo': 0, 'Fishing': 1, 'Bluk': 2, 'Dredging': 3, 'Container': 4, 'Tanker': 5, 'GeneralCargo': 6, 'Passenger': 7, 'Tug': 8} #fusar
-
-
-    # Load datasets
-    curriculum_data_dir = dir
-    easy_dataset = ImageFolder(os.path.join(curriculum_data_dir, "easy"), transform=transform_train)
-    moderate_dataset = ImageFolder(os.path.join(curriculum_data_dir, "moderate"), transform=transform_train)
-    hard_dataset = ImageFolder(os.path.join(curriculum_data_dir, "hard"), transform=transform_train)
-    validation_dataset = ImageFolder(os.path.join(curriculum_data_dir, "validation"), transform=transform_train)
-    test_dataset = ImageFolder(os.path.join(curriculum_data_dir, "test"), transform=transform_train)
-
-    # new_class_to_idx = {'Cargo': 0, 'Tanker': 1, 'Dredging': 2, 'Fishing': 3, 'Passenger': 4, 'Tug': 5} # opensar
-    # new_class_to_idx = {'Cargo': 0, 'Fishing': 1, 'Bluk': 2, 'Dredging': 3, 'Container': 4, 'Tanker': 5, 'GeneralCargo': 6, 'Passenger': 7, 'Tug': 8} #fusar
-
-
-    easy_dataset.class_to_idx = new_class_to_idx
-    moderate_dataset.class_to_idx = new_class_to_idx
-    hard_dataset.class_to_idx = new_class_to_idx
-    validation_dataset.class_to_idx = new_class_to_idx
-    test_dataset.class_to_idx = new_class_to_idx
-
-    # Create DataLoaders
-    batch_size = 32
-    easy_loader = DataLoader(easy_dataset, batch_size=batch_size, shuffle=True)
-    moderate_loader = DataLoader(moderate_dataset, batch_size=batch_size, shuffle=True)
-    hard_loader = DataLoader(hard_dataset, batch_size=batch_size, shuffle=True)
-    validation_loader = DataLoader(validation_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    return [easy_loader, moderate_loader, hard_loader, validation_loader, test_loader]
-
-print("DataLoaders created successfully.")
-
-print("Loading Data")
-
-def get_loaders_b(path, data, batch_size):
+def get_loaders_b(path, data, classes_l, batch_size, transform_train, m2m=False):
     loaders = []
-    loaders.append(load_data(path + "/train", batch_size=batch_size))
-    loaders.append(load_data(path + "/val", batch_size=batch_size))
-    loaders.append(load_data(path + "/test", batch_size=batch_size))
-    # fusar_path = path
-    # opensar_path = path
-    # classes = 0
-    # models = {}
-    # if data == 0:
-    #     loaders.append(load_data(opensar_path + "/train", batch_size=batch_size))
-    #     loaders.append(load_data(opensar_path + "/val", batch_size=batch_size))
-    #     loaders.append(load_data(opensar_path + "/test", batch_size=batch_size))
-    # else:
-    #     loaders.append(load_data(fusar_path + "/train", batch_size=batch_size))
-    #     loaders.append(load_data(fusar_path + "/val", batch_size=batch_size))
-    #     loaders.append(load_data(fusar_path + "/test", batch_size=batch_size))
+    # print(classes_l)
+    if m2m:
+        loaders.append(load_data_m2m(path + "/train", classes_l=classes_l, transform_train=transform_train, batch_size=batch_size))
+    else:
+        loaders.append(load_data(path + "/train", classes_l=classes_l, transform_train=transform_train, batch_size=batch_size))
+    
+    loaders.append(load_data(path + "/val", classes_l=classes_l, transform_train=transform_train, batch_size=batch_size))
+    loaders.append(load_data(path + "/test", classes_l=classes_l, transform_train=transform_train, batch_size=batch_size))
     
     return loaders
 
@@ -262,19 +250,121 @@ def calculate_centroids(features, labels, num_classes):
         centroids.append(class_features.mean(dim=0))
     return centroids
 
-def generate_synthetic_samples(features, labels, centroids, target_class, alpha=0.1):
+def generate_synthetic_samples_with_rejection(features, labels, centroids, target_class, alpha=0.1, max_samples=500, similarity_threshold=0.8, classifier=None):
+    """
+    Generate synthetic samples with rejection criteria.
+    
+    Args:
+        features (torch.Tensor): Feature vectors of the dataset, shape [num_samples, feature_dim].
+        labels (torch.Tensor): Corresponding labels, shape [num_samples].
+        centroids (list of torch.Tensor): List of class centroids.
+        target_class (int): Target minority class to generate synthetic samples for.
+        alpha (float): Translation factor for feature interpolation.
+        max_samples (int): Maximum number of synthetic samples to generate.
+        similarity_threshold (float): Maximum similarity to existing samples in the target class.
+        classifier (torch.nn.Module): Optional, a classifier to evaluate synthetic sample quality.
+    
+    Returns:
+        synthetic_features (torch.Tensor): Synthetic feature vectors.
+        synthetic_labels (torch.Tensor): Corresponding labels for synthetic features.
+    """
     synthetic_features = []
     synthetic_labels = []
     
+    # Collect existing features of the target class
+    target_class_features = features[labels == target_class]
+    
     for feature, label in zip(features, labels):
         if label != target_class:  # Only translate from majority classes
+            # Generate synthetic feature
             translated_feature = feature + alpha * (centroids[target_class] - feature)
+            
+            # Rejection criterion 1: Avoid redundancy using similarity
+            similarity = F.cosine_similarity(translated_feature.unsqueeze(0), target_class_features).max().item()
+            if similarity > similarity_threshold:
+                # print(similarity, label, target_class)
+                continue  # Skip overly similar samples
+            
+            # Rejection criterion 2: Model confidence (if classifier is provided)
+            if classifier is not None:
+                classifier.eval()  # Ensure the classifier is in evaluation mode
+                with torch.no_grad():
+                    confidence = F.softmax(classifier(translated_feature.unsqueeze(0)), dim=1)[0, target_class].item()
+                if confidence > 0.9:  # Skip if classifier is already confident
+                    continue
+            
+            # Add synthetic sample
             synthetic_features.append(translated_feature)
             synthetic_labels.append(target_class)
-
+            
+            # Stop if we reach the max_samples limit
+            if len(synthetic_features) >= max_samples:
+                print(label, len(synthetic_features))
+                break
+    
+    if len(synthetic_features) == 0:  # Handle case where no samples are accepted
+        return torch.empty(0, features.size(1)), torch.empty(0, dtype=torch.long)
+    
     return torch.stack(synthetic_features), torch.tensor(synthetic_labels)
 
-def m2m_creation(train_loader, feature_extractor, classes):
+def m2m_generate_synthetic_samples(features, labels, centroids, target_class, alpha=0.1, max_samples=500, rejection_threshold=0.5):
+    """
+    Generate synthetic samples for a minority class using M2m strategy with rejection criteria.
+    
+    Args:
+        features (torch.Tensor): Feature vectors of shape [num_samples, feature_dim].
+        labels (torch.Tensor): Corresponding labels of shape [num_samples].
+        centroids (list): List of precomputed centroids for each class.
+        target_class (int): Minority class for which synthetic samples are generated.
+        alpha (float): Translation factor to control the strength of the perturbation.
+        max_samples (int): Maximum number of synthetic samples to generate.
+        rejection_threshold (float): Threshold for rejecting redundant synthetic samples.
+        
+    Returns:
+        synthetic_features (torch.Tensor): Synthetic feature vectors.
+        synthetic_labels (torch.Tensor): Corresponding labels for synthetic features.
+    """
+    synthetic_features = []
+    synthetic_labels = []
+
+    # Extract the centroid of the target minority class
+    target_centroid = centroids[target_class]
+    
+    # Calculate distances to reject redundant samples
+    def is_valid_sample(new_sample, existing_samples, threshold):
+        if len(existing_samples) == 0:
+            return True  # First sample is always valid
+        distances = torch.norm(existing_samples - new_sample, dim=1)  # Euclidean distance
+        min_distance = torch.min(distances).item()
+        return min_distance > threshold  # Reject if too close to existing samples
+
+    # Generate synthetic samples
+    existing_synthetic_features = []
+    for feature, label in zip(features, labels):
+        if label != target_class:  # Translate from majority classes only
+            # Translate feature toward the target class centroid
+            translated_feature = feature + alpha * (target_centroid - feature)
+
+            # Apply rejection criteria
+            if is_valid_sample(translated_feature, torch.stack(existing_synthetic_features) if existing_synthetic_features else [], rejection_threshold):
+                synthetic_features.append(translated_feature)
+                synthetic_labels.append(target_class)
+                existing_synthetic_features.append(translated_feature)
+
+                # Stop if max_samples is reached
+                if len(synthetic_features) >= max_samples:
+                    print(target_class, len(synthetic_features))
+                    break
+    
+
+    if len(synthetic_features) == 0:
+        return torch.empty(0, features.size(1)), torch.empty(0, dtype=torch.long)
+    
+    return torch.stack(synthetic_features), torch.tensor(synthetic_labels)
+
+
+
+def m2m_creation(train_loader, feature_extractor, classes, minority_value, device, samp_met=0):
     # Extract features and labels
     features = []
     labels = []
@@ -293,104 +383,226 @@ def m2m_creation(train_loader, feature_extractor, classes):
     features = torch.cat(features, dim=0)  # Combine all feature tensors
     labels = torch.cat(labels, dim=0)      # Combine all label tensors
 
-    print(id)
+    # input_size = features.size(1) # baseline
+
+    # o_dataset = TensorDataset(features, labels) # baseline
+    # o_loader = DataLoader(o_dataset, batch_size=32, shuffle=True) # baseline
+
+    # return input_size, o_loader
+
+    # print(id)
 
     num_classes = classes
+    
     centroids = calculate_centroids(features, labels, num_classes)
+    # print("Centroids: ",centroids)
 
     # Identify minority classes (e.g., classes with fewer than a threshold number of samples)
     class_counts = torch.bincount(labels)
-    minority_classes = torch.where(class_counts < 66)[0]  # Adjust threshold as needed
+    print("class_counts", class_counts)
+    minority_classes = torch.where(class_counts < minority_value)[0]  # Adjust threshold as needed
+    print("Monority Classes: ",minority_classes, minority_value)
 
     for target_class in minority_classes:
-        features_aug, labels_aug = generate_synthetic_samples(features, labels, centroids, target_class)
+        if samp_met==0:
+            features_aug, labels_aug = generate_synthetic_samples_with_rejection(features, labels, centroids, target_class)
+        else:
+            features_aug, labels_aug = m2m_generate_synthetic_samples(features, labels, centroids, target_class)
         synthetic_features.append(features_aug)
         synthetic_labels.append(labels_aug)
 
     synthetic_features = torch.cat(synthetic_features, dim=0)
     synthetic_labels = torch.cat(synthetic_labels, dim=0)
 
+    print("Device: ",synthetic_features.shape, features.shape)
+
     # Combine original and synthetic data
     augmented_features = torch.cat([features, synthetic_features], dim=0)
     augmented_labels = torch.cat([labels, synthetic_labels], dim=0)
 
-    input_size = augmented_features.size(1)  # Size of feature vector
+    input_size = augmented_features.size(1)  # Size of feature vector uncomment
     # print(augmented_features.shape)
     # print(synthetic_features.shape)
     # print(features.shape)
 
     # Create DataLoader
     augmented_dataset = TensorDataset(augmented_features, augmented_labels)
+
     augmented_loader = DataLoader(augmented_dataset, batch_size=32, shuffle=True)
     # input_size = augmented_features.size(1)
     
     return input_size, augmented_loader
-
-def train_save(c_datasets_b, models, l_rate, device, epochs, classes, lf, ds):
-    csv_res = []
-    csv1 = []
-    results = ""
-    ds = ""
-    for dataset_name, dataset_loader in c_datasets_b.items():
-        print("Training on ", dataset_name)
-        ds = dataset_name
-        results += "Training on " + dataset_name + "\n"
-        # mix_path = "mix_5"
-        train_loader_m = dataset_loader[0]
-        val_loader_m = dataset_loader[1]
-        test_loader_m = dataset_loader[2]
-        for model_name, model in models.items():
-            feature_extractor = None
-            if "VIT" in model_name:
-                feature_extractor = model
-                print("VIT", model_name)
-            else:
-                feature_extractor = model.features
-                print("Non Vit", model_name)
-            feature_extractor.to(device)
-            ip, train_loader_n = m2m_creation(train_loader=train_loader_m, feature_extractor=feature_extractor, classes=classes)
-            print("Training using :" , model_name)
-            results += "Training using "+model_name + "\n"
-                
-            n_model = MinorityClassClassifier(input_size=ip, classes=classes, mod=model_name)
-            n_model.apply(initialize_weights)
-            optimizer = optim.Adam(n_model.parameters(), lr=l_rate)
-            n_model.to(device)
-            # Training loop
-            for epoch in range(epochs):
-                n_model.train()
-                # print(epoch)
-                for batch_idx, data in enumerate(train_loader_n):
-                    data, target = data[0].to(device), data[1].to(device)
-
-                    optimizer.zero_grad()
-
-                    output = n_model(data)
-
-                    loss = lf(output, target)
-                    loss.backward()
-                    optimizer.step()
-                # else:
-                print("Validation: ", dataset_name)
-                results += f"Validation {model_name} on {dataset_name} \n"
-                str_results, _ = evaluate_model(n_model, val_loader_m, feature_extractor=feature_extractor, device=device)
-                results += str_results
-            print("Testing: ", dataset_name)
-            results += f"Testing {model_name} on {dataset_name} \n"
-            str_results, csv_scores = evaluate_model(n_model, test_loader_m, feature_extractor=feature_extractor, device=device)
-            results += str_results
-            csv_res.append(csv_scores)
-            csv1.append(csv_scores)
+def train_save_1(data_dict, l_rate, device, epochs, lf):
+    sampling_methods = ["sat1", "m2m"]
+    for ij in range(2):
+        csv_res = []
+        csv1 = []
+        results = ""
+        ds = sampling_methods[ij] + "_"
+        for dataset_name, dataset_loader in data_dict.items():
+            print("Training on ", dataset_name)
+            ds += dataset_name + "_"
+            results += "Training on " + dataset_name + "\n"
+            classes = dataset_loader[1]
             
-        # save_model(n_model, save_dir, model_filename)
+            minority_value = dataset_loader[2]
+            models = {
+            # "VIT": vit(classes, frozen=True),
+            "Fine_VGG": FineTunedVGG(classes),
+            "Fine_Resnet": FineTunedResNet(classes)
+            }
+            # mix_path = "mix_5"
+            train_loader_m = dataset_loader[0][0]
+            val_loader_m = dataset_loader[0][1]
+            test_loader_m = dataset_loader[0][2]
+            for model_name, model in models.items():
+                print("Training using :" , model_name)
+                feature_extractor = None
+                ds += model_name
+                if "VIT" in model_name:
+                    feature_extractor = model
+                    # print("VIT", model_name)
+                else:
+                    feature_extractor = model.features
+                    # print("Non Vit", model_name)
+                feature_extractor.to(device)
+                # if baseline:
+                #     train_loader_n = train_loader_m
+                # else:
+                #     ip, train_loader_n = m2m_creation(train_loader=train_loader_m, feature_extractor=feature_extractor, classes=classes, minority_value=minority_value, device=device, samp_met=ij)
+                ip, train_loader_n = m2m_creation(train_loader=train_loader_m, feature_extractor=feature_extractor, classes=classes, minority_value=minority_value, device=device, samp_met=ij)
+                
+                results += "Training using "+model_name + "\n"
+                    
+                n_model = MinorityClassClassifier(input_size=ip, classes=classes, mod=model_name)
+                n_model.apply(initialize_weights)
+                optimizer = optim.Adam(n_model.parameters(), lr=l_rate)
+                n_model.to(device)
+                # Training loop
+                for epoch in range(epochs):
+                    n_model.train()
+                    # print(epoch)
+                    for batch_idx, data in enumerate(train_loader_m):
+                        data, target = data[0].to(device), data[1].to(device)
 
-    # Open the file in write mode ("w") and write the string to it
-    with open(f"scores/sampling_results_{ds}.txt", "w") as f:
-        f.write(results)
+                        optimizer.zero_grad()
 
-    fields = ["Accuracy", "Precision", "Recall", "F1"] * (classes +1)
+                        output = n_model(data)
 
-    with open(f"scores/sampling_results_{ds}.csv", 'w') as f:
-            write = csv.writer(f)
-            write.writerow(fields)
-            write.writerows(csv1)
+                        loss = lf(output, target)
+                        loss.backward()
+                        optimizer.step()
+                    # else:
+                    print("Validation: ", epoch, dataset_name)
+                    results += f"Validation {model_name} on {dataset_name} \n"
+                    str_results, _, _ = evaluate_model(n_model, val_loader_m, feature_extractor=feature_extractor, device=device)
+                    results += str_results
+                print("Testing: ", dataset_name)
+                results += f"Testing {model_name} on {dataset_name} \n"
+                str_results, csv_scores, dict_o = evaluate_model(n_model, test_loader_m, feature_extractor=feature_extractor, device=device)
+                print(dict_o)
+                results += str_results
+                csv_res.append(csv_scores)
+                csv1.append(csv_scores)
+                
+            # save_model(n_model, save_dir, model_filename)
+
+        # Open the file in write mode ("w") and write the string to it
+        with open(f"scores/sampling_results_{ds}_64.txt", "w") as f:
+            f.write(results)
+
+        fields = ["Accuracy", "Precision", "Recall", "F1"] * (classes +1)
+
+        with open(f"scores/sampling_results_{ds}_64.csv", 'w') as f:
+                write = csv.writer(f)
+                write.writerow(fields)
+                write.writerows(csv1)
+
+def train_save_b(data_dict, l_rate, device, epochs, lf, m2m=False):
+    sampling_methods = ["M2MM", "base"]
+    for ij in range(1):
+        csv_res = []
+        csv1 = []
+        results = ""
+        ds = sampling_methods[ij] + "_"
+        if m2m:
+            ds += "m2m" + "_"
+        for dataset_name, dataset_loader in data_dict.items():
+            print("Training on ", dataset_name)
+            ds += dataset_name + "_"
+            results += "Training on " + dataset_name + "\n"
+            classes = dataset_loader[1]
+            
+            minority_value = dataset_loader[2]
+            models = {
+            # "VIT": vit(classes, frozen=True),
+            "Fine_VGG": FineTunedVGG(classes),
+            "Fine_Resnet": FineTunedResNet(classes)
+            }
+            # mix_path = "mix_5"
+            train_loader_m = dataset_loader[0][0]
+            val_loader_m = dataset_loader[0][1]
+            test_loader_m = dataset_loader[0][2]
+            for model_name, model in models.items():
+                print("Training using :" , model_name)
+                feature_extractor = None
+                ds += model_name
+                # if "VIT" in model_name:
+                #     feature_extractor = model
+                #     # print("VIT", model_name)
+                # else:
+                #     feature_extractor = model.features
+                #     # print("Non Vit", model_name)
+                # feature_extractor.to(device)
+                # if baseline:
+                #     train_loader_n = train_loader_m
+                # else:
+                #     ip, train_loader_n = m2m_creation(train_loader=train_loader_m, feature_extractor=feature_extractor, classes=classes, minority_value=minority_value, device=device, samp_met=ij)
+                # ip, train_loader_n = m2m_creation(train_loader=train_loader_m, feature_extractor=feature_extractor, classes=classes, minority_value=minority_value, device=device, samp_met=ij)
+                
+                results += "Training using "+model_name + "\n"
+                    
+                # n_model = MinorityClassClassifier(input_size=ip, classes=classes, mod=model_name)
+                n_model = model
+                n_model.apply(initialize_weights)
+                optimizer = optim.Adam(n_model.parameters(), lr=l_rate)
+                n_model.to(device)
+                # Training loop
+                for epoch in range(epochs):
+                    n_model.train()
+                    # print(epoch)
+                    for batch_idx, data in enumerate(train_loader_m):
+                        data, target = data[0].to(device), data[1].to(device)
+
+                        optimizer.zero_grad()
+
+                        output = n_model(data)
+
+                        loss = lf(output, target)
+                        loss.backward()
+                        optimizer.step()
+                    # else:
+                    print("Validation: ", epoch, dataset_name)
+                    results += f"Validation {model_name} on {dataset_name} \n"
+                    str_results, _, _ = evaluate_model(n_model, val_loader_m, feature_extractor=feature_extractor, device=device)
+                    results += str_results
+                print("Testing: ", dataset_name)
+                results += f"Testing {model_name} on {dataset_name} \n"
+                str_results, csv_scores, dict_o = evaluate_model(n_model, test_loader_m, feature_extractor=feature_extractor, device=device)
+                print(dict_o)
+                results += str_results
+                csv_res.append(csv_scores)
+                csv1.append(csv_scores)
+                
+            # save_model(n_model, save_dir, model_filename)
+
+        # Open the file in write mode ("w") and write the string to it
+        # with open(f"scores/base_sampling_results_{ds}_64.txt", "w") as f:
+        #     f.write(results)
+
+        fields = ["Accuracy", "Precision", "Recall", "F1"] * (classes +1)
+
+        with open(f"scores/original_sampling_{ds}_64.csv", 'w') as f:
+                write = csv.writer(f)
+                write.writerow(fields)
+                write.writerows(csv1)
