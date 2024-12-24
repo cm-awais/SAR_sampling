@@ -156,8 +156,7 @@ class FineTunedResNet(nn.Module):
     
 def vit(classes, frozen=True):
     vit_model = timm.create_model("vit_base_patch16_224", pretrained=True)
-    # vit_model.head = nn.Linear(vit_model.head.in_features, classes)
-
+    vit_model.head = nn.Linear(vit_model.head.in_features, classes)
 
     if frozen:
         for param in vit_model.patch_embed.parameters():
