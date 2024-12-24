@@ -524,9 +524,11 @@ def train_save_b(data_dict, l_rate, device, epochs, lf, m2m=False):
         csv_res = []
         csv1 = []
         results = ""
-        ds = sampling_methods[ij] + "_"
+        ds = ""
         if m2m:
             ds += "m2m" + "_"
+        else:
+            ds += "baseline" + "_"
         for dataset_name, dataset_loader in data_dict.items():
             print("Training on ", dataset_name)
             ds += dataset_name + "_"
